@@ -1,105 +1,114 @@
-import random
 import numpy as np
 import matplotlib.pyplot as plt
-def accept_with_prob(delta_cost, beta, betamax):
-    if beta > betamax:
-        return False
+
+
+def accept_with_prob(delta_cost, beta):
+    """Metropolis rule: True with probability min{1, exp(-beta * delta_cost)}."""
     if delta_cost <= 0:
         return True
-    
-    prob = np.exp(-beta * delta_cost)
-    return np.random.random() < prob #True with the correct probaility, otherwise false 
+    return np.random.random() < np.exp(-beta * delta_cost)
+
+
+def two_segment_schedule(beta0, beta1, anneal_steps):
+    """
+    The report's finite schedule (Section 4): the first anneal_steps // 3 values
+    go linearly from beta0 to log10(beta1), the remaining ones linearly from
+    log10(beta1) to beta1.
+    """
+    if anneal_steps < 1:
+        raise ValueError("anneal_steps must be at least 1")
+    if beta1 <= 0:
+        raise ValueError("beta1 must be positive")
+    if not 0 <= beta0 <= np.log10(beta1):
+        raise ValueError("need 0 <= beta0 <= log10(beta1), so that the schedule increases")
+    k = anneal_steps // 3
+    return np.concatenate([
+        np.linspace(beta0, np.log10(beta1), k),
+        np.linspace(np.log10(beta1), beta1, anneal_steps - k),
+    ])
+
 
 # meta-heuristic method for solving an optimization problem.
 # One needs to define:
 # - probl.init_config()
 # - probl.cost()
-# - probl.display()
+# - probl.copy()
 # - move = probl.propose_move()
-# - probl.accept(move)
-# - delta_c = compute_delta_cost(move)
-def simann(probl, beta0=0.1, beta1=10., anneal_steps=10,
-           mcmc_steps=10, seed=None, wait = 10, wait_2 = 30):
+# - delta_c = probl.compute_delta_cost(move)
+# - probl.accept_move(move)
+def simann(probl, beta0=0.1, beta1=10., anneal_steps=10, mcmc_steps=10, seed=None,
+           wait=10, wait_2=30, betas=None, plot=False, verbose=True, return_history=False):
     """
     Inputs:
-        -probl: the class of the problem you want to solve
-        -beta0: the maximum temperature - the minimum beta value
-        -beta1: the minimum temperature - the maximum beta value
-        -anneal_steps: number of steps that are between beta0 and beta1
+        -probl: the problem to solve (e.g. a Grid)
+        -beta0: the minimum beta value (maximum temperature)
+        -beta1: the maximum beta value (minimum temperature)
+        -anneal_steps: number of beta values between beta0 and beta1
         -mcmc_steps: Markov Chain Monte Carlo steps for each beta value
-        -seed: random seed (for debugging purposes)
-        -wait: number of times the algorithm is allowed to accept 0 moves before halting
-        -wait_2: number of times the algorithm is allowed to not improve the best cost before halting
-    A better implementation of the Simulated Annealing, as now
-    if no moves are accepted for 'wait' times in a row, the code
-    stops early. Also, if for 'wait_2' times in a row, a better cost
-    isn't found, it stops. It also plots the frequency moves are accepted
-    over the beta value and changed the way the betas are 
-    calculated, putting together two linear spaces, with a third of the
-    anneal_steps dedicated to the space that goes from beta0 to log_10(beta1)
-    and the other two thirds from log_10(beta1) to beta1
-    """
-    # Note, if a line is commented with a double hasthag, like below,
-    ## it means they've been removed for efficiency tests, but should be uncommented to display the various steps
+        -seed: random seed. The starting configuration is drawn after seeding,
+               so a run is fully determined by the problem and the seed
+        -wait: halt after this many consecutive beta values in which the walker
+               never moved (None disables this rule)
+        -wait_2: halt after this many consecutive beta values without improving
+                 the best cost (None disables this rule)
+        -betas: optional custom schedule that replaces beta0, beta1 and
+                anneal_steps, e.g. the logarithmic schedule of the report,
+                np.log(2 + np.arange(T)) / c, together with mcmc_steps=1
+        -plot: plot the frequency of accepted moves against beta
+        -verbose: print the best cost at the end
+        -return_history: also return a dict with statistics for each beta
+    Returns best_probl, best_c (and history if return_history is True), where
+    best_probl is a copy of the problem at the best configuration visited.
 
-    #print(f"Running version 7 of SimAnn, class of problem: {probl.name()}")
-    
+    Each step proposes a move with probl.propose_move() and accepts it with the
+    Metropolis rule, using the cost change of exactly the move that was proposed.
+    A proposed null move (0, 0) leaves the walker where it is.
+    """
     if seed is not None:
         np.random.seed(seed)
+    probl.init_config()
+    if betas is None:
+        betas = two_segment_schedule(beta0, beta1, anneal_steps)
+
     best_c = probl.cost()
-    cx = best_c
-    #print(f"initial cost is c={best_c}")
     best_probl = probl.copy()
-    third_anneal_steps = anneal_steps // 3
-    betas = np.concatenate([
-        np.linspace(beta0, np.log10(beta1), third_anneal_steps),
-        np.linspace(np.log10(beta1), beta1, anneal_steps - third_anneal_steps)
-    ])
-    betas = np.append(betas, np.inf)
-    jumps = np.arange(1, anneal_steps + 2)
-    #print(betas)
-    patience, second_patience = wait, 0
-    frequency = []
-    idx = 0
+    patience, stale = wait, 0
+    history = {"beta": [], "accept_freq": [], "cost": [], "best_cost": []}
+
     for beta in betas:
-        idx += 1
-        probl.cost_cache = {}
-        accepted_moves = 0
-        second_patience += 1
-        for t in range(mcmc_steps):
+        accepted, improved = 0, False
+        for _ in range(mcmc_steps):
             move = probl.propose_move()
+            if tuple(move) == (0, 0):  # null move: the walker stays where it is
+                continue
             delta_c = probl.compute_delta_cost(move)
-            current_x, current_y = probl.position_x, probl.position_y
-            dx, dy = move
-            random_idx = np.random.randint(0, idx, 2)
-            multiplier_x, multiplier_y = jumps[random_idx[0]], jumps[random_idx[1]]
-            #print(random_multiplier)
-            newdx, newdy = dx * multiplier_x, dy * multiplier_y
-            move = (newdx, newdy)
-
-
-            if accept_with_prob(delta_c, beta, beta1):
-                accepted_moves += 1
+            if accept_with_prob(delta_c, beta):
                 probl.accept_move(move)
-                cx = probl.cost()
-                if best_c > cx:
-                    second_patience = 0
-                    best_c = cx
-                    best_probl = probl.copy()
-                    #(f"Sanity check: {best_probl.f_values[best_probl.position_x, best_probl.position_y] == best_c}")
+                accepted += 1
+                c = probl.cost()
+                if c < best_c:
+                    best_c, best_probl, improved = c, probl.copy(), True
 
-           
-        #print(f"Sanity check: {best_probl.f_values[best_probl.position_x, best_probl.position_y] == best_c}")
-        if second_patience == wait_2 or patience == 0:
-            break
-        patience = wait if accepted_moves > 0 else patience - 1
-        ##best_probl.display_beta(beta)
-        #print(f"beta={beta} accept_freq={accepted_moves/mcmc_steps} c={cx} best_c={best_c}")
-        frequency.append(accepted_moves/mcmc_steps)
-        
-    ##best_probl.display()
-    print(f"best cost = {best_c}")
-    plot_betas = betas[:len(frequency)]
-    plt.plot(plot_betas,frequency,marker = ".")
-    
+        history["beta"].append(beta)
+        history["accept_freq"].append(accepted / mcmc_steps)
+        history["cost"].append(probl.cost())
+        history["best_cost"].append(best_c)
+
+        if wait is not None:
+            patience = wait if accepted > 0 else patience - 1
+            if patience <= 0:
+                break
+        if wait_2 is not None:
+            stale = 0 if improved else stale + 1
+            if stale >= wait_2:
+                break
+
+    if verbose:
+        print(f"best cost = {best_c}")
+    if plot:
+        plt.plot(history["beta"], history["accept_freq"], marker=".")
+        plt.xlabel("beta")
+        plt.ylabel("frequency of accepted moves")
+    if return_history:
+        return best_probl, best_c, history
     return best_probl, best_c
